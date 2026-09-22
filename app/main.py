@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
+from .audit import audit_timeline
 from .config import Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
@@ -32,6 +33,8 @@ from .schemas import (
     RollbackPreview,
     RollbackPreviewRequest,
     ServiceWaveChange,
+    TimelineAuditRequest,
+    TimelineAuditResult,
     Wave,
 )
 
@@ -46,14 +49,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
         "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
         "impact of constraint changes on a stored plan, gate execution "
-        "of a rollout against completed and failed services, and preview "
-        "minimum rollback waves for the currently deployed services."
+        "of a rollout against completed and failed services, preview "
+        "minimum rollback waves for the currently deployed services, and "
+        "audit the actual per-service execution timeline against the stored "
+        "waves and dependency DAG."
     ),
     lifespan=lifespan,
 )
@@ -77,6 +82,24 @@ async def planning_error_handler(request: Request, exc: PlanningError) -> JSONRe
     )
 
 
+# Fields whose validation errors are localized to an individual service.
+_SERVICE_LIST_FIELDS = (
+    "services",
+    "dependencies",
+    "fault_domains",
+    "completed_services",
+    "failed_services",
+    "deployed_services",
+    "service_timelines",
+)
+
+# Trailing loc elements that name a *property* of a nested object rather than
+# a service id, so they must not be reported as the offending service.
+_NESTED_FIELD_NAMES = frozenset(
+    ("service", "depends_on", "domain", "services", "started_at", "finished_at")
+)
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_handler(
     request: Request, exc: RequestValidationError
@@ -85,15 +108,12 @@ async def request_validation_handler(
     for err in exc.errors():
         loc = [str(p) for p in err.get("loc", []) if p not in ("body",)]
         service = None
-        if loc and loc[0] in (
-            "services",
-            "dependencies",
-            "fault_domains",
-            "completed_services",
-            "failed_services",
-            "deployed_services",
-        ):
-            service = loc[-1] if loc[-1].isidentifier() or "-" in loc[-1] else None
+        if loc and loc[0] in _SERVICE_LIST_FIELDS:
+            tail = loc[-1]
+            if (
+                tail.isidentifier() or "-" in tail
+            ) and tail not in _NESTED_FIELD_NAMES:
+                service = tail
         issues.append(
             Issue(
                 code="invalid_request_field",
@@ -415,4 +435,49 @@ def preview_plan_rollback(
         wave_count=output.wave_count,
         max_concurrency=concurrency,
         optimal=output.optimal,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/timeline-audit",
+    response_model=TimelineAuditResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def audit_plan_timeline(
+    plan_id: int,
+    payload: TimelineAuditRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> TimelineAuditResult:
+    """Audit actual per-service execution times against the stored plan.
+
+    Every service of the stored plan must report exactly one ISO 8601
+    ``started_at``/``finished_at`` window. The windows are checked against the
+    stored wave barriers (a service may not start before the whole preceding
+    wave finished) and the dependency DAG (not before any direct prerequisite
+    finished); each violation names the service, the constraint object and the
+    overlap in milliseconds. For well-formed input the per-wave actual
+    durations and the duration-weighted critical chain are returned as well.
+    The stored plan is read but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_members = [list(wave["services"]) for wave in stored["waves"]]
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+
+    output = audit_timeline(services, wave_members, edges, payload)
+
+    return TimelineAuditResult(
+        plan_id=row["id"],
+        name=row["name"],
+        valid=output.valid,
+        violations=output.violations,
+        service_timings=output.service_timings,
+        waves=output.waves,
+        critical_chain=output.critical_chain,
+        total_duration_ms=output.total_duration_ms,
     )

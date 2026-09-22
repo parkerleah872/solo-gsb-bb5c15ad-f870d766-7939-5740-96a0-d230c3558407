@@ -1134,3 +1134,407 @@ def test_rollback_is_deterministic_and_input_order_stable(client):
     ]
     assert responses[0] == responses[1] == responses[2]
     assert responses[0]["deployed_services"] == ["a", "b", "c", "d"]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/timeline-audit
+# ---------------------------------------------------------------------------
+
+
+def _timeline_entry(service, started, finished):
+    return {"service": service, "started_at": started, "finished_at": finished}
+
+
+def test_timeline_audit_valid_timeline(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]], d depends on b and c.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:40Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["valid"] is True
+    assert body["violations"] == []
+
+    timings = body["service_timings"]
+    assert timings["a"]["duration_ms"] == 10_000
+    assert timings["b"]["duration_ms"] == 10_000
+    assert timings["c"]["duration_ms"] == 30_000
+    assert timings["d"]["duration_ms"] == 10_000
+    assert timings["a"]["started_at"] == "2026-09-22T10:00:00Z"
+
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["started_at"] == "2026-09-22T10:00:00Z"
+    assert waves[1]["finished_at"] == "2026-09-22T10:00:10Z"
+    assert waves[1]["duration_ms"] == 10_000
+    assert waves[1]["services"] == ["a"]
+    assert waves[2]["duration_ms"] == 30_000  # b finishes at :20, c at :40
+    assert waves[2]["services"] == ["b", "c"]
+    assert waves[3]["duration_ms"] == 10_000
+
+    assert body["total_duration_ms"] == 50_000
+
+
+def test_timeline_audit_critical_chain_uses_service_durations(client):
+    # [[a], [b, c], [d]]; chains: a-b-d (10+10+10=30s), a-c-d (10+30+10=50s).
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:40Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    chain = body["critical_chain"]
+    assert chain["services"] == ["a", "c", "d"]
+    assert chain["duration_ms"] == 50_000
+
+
+def test_timeline_audit_critical_chain_tie_resolves_lexicographically(client):
+    # All durations equal: the length-3 chains a->b->d and a->c->d tie, and
+    # the prerequisite-first lexicographically smallest chain is reported.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:30Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["critical_chain"]["services"] == ["a", "b", "d"]
+    assert body["critical_chain"]["duration_ms"] == 30_000
+
+
+def test_timeline_audit_dependency_violation_overlap(client):
+    # d starts 5s before its (late) prerequisite c finishes; b is fine. The
+    # dependency edge d->c and the wave-2 barrier are both broken by the same
+    # late member c, so both violations are reported, each with the overlap.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:35Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["valid"] is False
+    dep_violations = [
+        v for v in body["violations"] if v["constraint_type"] == "dependency"
+    ]
+    assert len(dep_violations) == 1
+    violation = dep_violations[0]
+    assert violation["service"] == "d"
+    assert violation["constraint"] == "c"
+    assert violation["blocking_service"] == "c"
+    assert violation["overlap_ms"] == 5_000
+    # Durations and the critical chain are still computed on well-formed input.
+    assert body["service_timings"]["d"]["duration_ms"] == 15_000
+    assert body["critical_chain"]["services"] == ["a", "c", "d"]
+
+
+def test_timeline_audit_each_unfinished_dependency_is_reported(client):
+    # d starts while BOTH direct prerequisites b and c are still running:
+    # two dependency violations (one per edge) plus the wave-2 barrier.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:30Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    dep = {
+        v["constraint"]: v
+        for v in body["violations"]
+        if v["constraint_type"] == "dependency"
+    }
+    assert set(dep) == {"b", "c"}
+    assert dep["b"]["overlap_ms"] == 10_000
+    assert dep["c"]["overlap_ms"] == 20_000
+    wave = [v for v in body["violations"] if v["constraint_type"] == "previous_wave"]
+    assert len(wave) == 1
+    assert wave[0]["constraint"] == "wave 2"
+    assert wave[0]["blocking_service"] == "c"
+    assert wave[0]["overlap_ms"] == 20_000
+
+
+def test_timeline_audit_previous_wave_violation_names_blocker(client):
+    # Independent services with a concurrency cap produce capacity-driven
+    # waves with no dependency edges: [[a, b], [c, d]]. c starts while the
+    # latest-finishing member of wave 1 (a) is still running.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("b", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("c", "2026-09-22T10:00:15Z", "2026-09-22T10:00:25Z"),
+            _timeline_entry("d", "2026-09-22T10:00:25Z", "2026-09-22T10:00:35Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    assert len(body["violations"]) == 1
+    v = body["violations"][0]
+    assert v["service"] == "c"
+    assert v["constraint_type"] == "previous_wave"
+    assert v["constraint"] == "wave 1"
+    assert v["blocking_service"] == "a"
+    assert v["overlap_ms"] == 5_000
+
+
+def test_timeline_audit_wave_barrier_uses_latest_finishing_member(client):
+    # Wave 2 = [b, c]. d starts after b finished but 3s before c finishes:
+    # one dependency violation (c) and one wave-2 barrier violation (blocker c).
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:37Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    types = {(v["constraint_type"], v["constraint"]) for v in body["violations"]}
+    assert ("dependency", "c") in types
+    assert ("previous_wave", "wave 2") in types
+    for v in body["violations"]:
+        if v["constraint_type"] == "previous_wave":
+            assert v["service"] == "d"
+            assert v["blocking_service"] == "c"
+            assert v["overlap_ms"] == 3_000
+
+
+def test_timeline_audit_exact_coincidence_is_not_a_violation(client):
+    # Starting at the exact finish instant of every prerequisite is allowed
+    # (zero overlap), including sub-second precision and timezone offsets.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T12:00:00+02:00", "2026-09-22T12:00:00.500+02:00"),
+            _timeline_entry("b", "2026-09-22T10:00:00.500Z", "2026-09-22T10:00:01Z"),
+            _timeline_entry("c", "2026-09-22T10:00:00.500Z", "2026-09-22T10:00:01Z"),
+            _timeline_entry("d", "2026-09-22T10:00:01Z", "2026-09-22T10:00:02Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["violations"] == []
+    # Naive timestamps are interpreted as UTC; a started at 10:00:00Z.
+    assert body["service_timings"]["a"]["started_at"] == "2026-09-22T10:00:00Z"
+    assert body["service_timings"]["a"]["duration_ms"] == 500
+
+
+def test_timeline_audit_naive_timestamp_is_read_as_utc(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00", "2026-09-22T10:00:10"),
+            _timeline_entry("b", "2026-09-22T10:00:10", "2026-09-22T10:00:20"),
+            _timeline_entry("c", "2026-09-22T10:00:10", "2026-09-22T10:00:20"),
+            _timeline_entry("d", "2026-09-22T10:00:20", "2026-09-22T10:00:30"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["service_timings"]["a"]["started_at"] == "2026-09-22T10:00:00Z"
+
+
+def test_timeline_audit_missing_service_is_422(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            # d missing
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "missing_service_timeline"
+    assert issue["service"] == "d"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c", "d")
+    ]
+    entries.append(
+        _timeline_entry("ghost", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["service"] == "ghost"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c")
+    ]
+    entries.append(
+        _timeline_entry("a", "2026-09-22T11:00:00Z", "2026-09-22T11:00:10Z")
+    )
+    entries.append(
+        _timeline_entry("d", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_timeline"
+    assert issue["service"] == "a"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_inverted_window_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c", "d")
+    ]
+    entries[2] = _timeline_entry(
+        "c", "2026-09-22T10:00:20Z", "2026-09-22T10:00:10Z"
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "timeline_inverted"
+    assert issue["service"] == "c"
+    assert issue["constraint"] == "service_timelines"
+    assert issue["context"]["started_at"] == "2026-09-22T10:00:20+00:00"
+    assert issue["context"]["finished_at"] == "2026-09-22T10:00:10+00:00"
+
+
+def test_timeline_audit_zero_duration_window_is_allowed(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:00Z"),
+            _timeline_entry("b", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("c", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("d", "2026-09-22T10:00:10Z", "2026-09-22T10:00:10Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["service_timings"]["a"]["duration_ms"] == 0
+    assert body["total_duration_ms"] == 10_000
+
+
+def test_timeline_audit_bad_timestamp_is_validation_error(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            {"service": "a", "started_at": "not-a-date", "finished_at": "2026-09-22T10:00:10Z"},
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    issue = body["issues"][0]
+    assert issue["code"] == "invalid_request_field"
+    assert "started_at" in issue["constraint"]
+    # The nested property name must not be mistaken for a service id.
+    assert issue["service"] is None
+
+
+def test_timeline_audit_empty_list_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": []}
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_timeline_audit_missing_plan_is_404(client):
+    # A syntactically valid body still gets 404: the plan lookup precedes the
+    # semantic coverage check.
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        ]
+    }
+    r = client.post("/plans/9999/timeline-audit", json=payload)
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_timeline_audit_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    valid = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:30Z"),
+        ]
+    }
+    assert client.post(f"/plans/{plan['id']}/timeline-audit", json=valid).status_code == 200
+
+    bad = {"service_timelines": [valid["service_timelines"][0]]}
+    assert client.post(f"/plans/{plan['id']}/timeline-audit", json=bad).status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_timeline_audit_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:35Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    shuffled = {"service_timelines": list(reversed(payload["service_timelines"]))}
+    responses = [
+        client.post(f"/plans/{plan['id']}/timeline-audit", json=body).json()
+        for body in (payload, shuffled, payload)
+    ]
+    assert responses[0] == responses[1] == responses[2]

@@ -7,6 +7,7 @@ expresses "services in this domain cannot co-locate in a wave".
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -160,6 +161,44 @@ class RollbackPreviewRequest(BaseModel):
         if any(not s for s in cleaned):
             raise ValueError("service id must not be blank")
         return cleaned
+
+
+class ServiceTimeline(BaseModel):
+    """One service's actual execution window during a rollout."""
+
+    service: str = Field(..., min_length=1, description="Service id of the stored plan")
+    started_at: datetime = Field(
+        ...,
+        description="Actual start instant, ISO 8601 (naive values are read as UTC)",
+    )
+    finished_at: datetime = Field(
+        ...,
+        description="Actual finish instant, ISO 8601 (must not precede started_at)",
+    )
+
+    @field_validator("service")
+    @classmethod
+    def _strip_service_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("service id must not be blank")
+        return v
+
+
+class TimelineAuditRequest(BaseModel):
+    """Actual per-service execution timeline for a stored plan.
+
+    Exactly one entry per service of the plan is required. Each service must
+    have started only after every service of the previous wave and every
+    direct dependency had finished; violations are reported per constraint.
+    The stored plan is never modified.
+    """
+
+    service_timelines: list[ServiceTimeline] = Field(
+        ...,
+        min_length=1,
+        description="One started_at/finished_at pair per service of the plan",
+    )
 
 
 # ---- Response models -------------------------------------------------------
@@ -320,6 +359,95 @@ class RollbackPreview(BaseModel):
     )
     optimal: bool = Field(
         ..., description="True when the minimum wave count is proven by the solver"
+    )
+
+
+class TimelineViolation(BaseModel):
+    """One broken ordering constraint found in the reported execution timeline."""
+
+    service: str = Field(..., description="Service that started too early")
+    constraint_type: Literal["previous_wave", "dependency"] = Field(
+        ...,
+        description="previous_wave: a service of the preceding wave was still "
+        "running; dependency: a direct prerequisite was still running",
+    )
+    constraint: str = Field(
+        ...,
+        description="Object enforcing the constraint: 'wave N' (1-based) for a "
+        "wave barrier, or the id of the direct prerequisite service",
+    )
+    blocking_service: str | None = Field(
+        ...,
+        description="The previous-wave/dependency service whose late finish "
+        "causes the overlap (null only for an empty preceding wave, which "
+        "cannot violate the barrier)",
+    )
+    overlap_ms: int = Field(
+        ...,
+        ge=0,
+        description="Milliseconds by which service started before the "
+        "constraint was satisfied (0 when instants coincide is not a violation)",
+    )
+
+
+class ServiceTiming(BaseModel):
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: int = Field(..., ge=0, description="finished_at - started_at")
+
+
+class WaveTiming(BaseModel):
+    index: int = Field(..., ge=1, description="1-based stored wave number")
+    started_at: datetime = Field(..., description="Earliest service start in the wave")
+    finished_at: datetime = Field(..., description="Latest service finish in the wave")
+    duration_ms: int = Field(..., ge=0, description="finished_at - started_at")
+    services: list[str] = Field(..., description="Wave members, sorted")
+
+
+class CriticalChain(BaseModel):
+    """Longest weighted path through the dependency DAG (the actual critical path)."""
+
+    services: list[str] = Field(
+        ...,
+        description="Services on the chain, prerequisite first; the chain with "
+        "the largest summed service duration, ties broken lexicographically"
+    )
+    duration_ms: int = Field(
+        ...,
+        ge=0,
+        description="Sum of the per-service durations on the chain"
+    )
+
+
+class TimelineAuditResult(BaseModel):
+    """Outcome of a read-only execution-timeline audit; never persisted."""
+
+    plan_id: int
+    name: str | None
+    valid: bool = Field(
+        ...,
+        description="True when no service started before the previous wave and "
+        "every direct dependency had finished",
+    )
+    violations: list[TimelineViolation] = Field(
+        ...,
+        description="Every violated wave/dependency constraint, deterministically ordered"
+    )
+    service_timings: dict[str, ServiceTiming] = Field(
+        ..., description="Normalized windows and durations per service id"
+    )
+    waves: list[WaveTiming] = Field(
+        ..., description="Actual per-wave time spans, in stored wave order"
+    )
+    critical_chain: CriticalChain = Field(
+        ...,
+        description="Longest total-duration chain on the dependency DAG, "
+        "weighted by actual service durations",
+    )
+    total_duration_ms: int = Field(
+        ...,
+        ge=0,
+        description="Earliest start to latest finish across every service",
     )
 
 
