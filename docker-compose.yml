@@ -1,0 +1,26 @@
+services:
+  wave-planner:
+    build: .
+    image: release-wave-planner:1.3.0
+    container_name: release-wave-planner
+    ports:
+      - "${PLANNER_PORT:-8000}:8000"
+    environment:
+      # SQLite file lives on the named volume so records survive restarts.
+      PLANNER_DB_PATH: /data/plans.db
+      # Per-phase CP-SAT wall-clock budget (seconds).
+      PLANNER_SOLVER_TIME_LIMIT: "10"
+      # 1 search worker + fixed seed => deterministic plans.
+      PLANNER_SOLVER_WORKERS: "1"
+    volumes:
+      - planner-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  planner-data:
