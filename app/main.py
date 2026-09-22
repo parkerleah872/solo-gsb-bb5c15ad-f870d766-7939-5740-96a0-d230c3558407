@@ -32,8 +32,11 @@ from .schemas import (
     RollbackPreview,
     RollbackPreviewRequest,
     ServiceWaveChange,
+    TimelineAuditRequest,
+    TimelineAuditResult,
     Wave,
 )
+from .timeline import audit_timeline
 
 
 @asynccontextmanager
@@ -46,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
@@ -85,15 +88,30 @@ async def request_validation_handler(
     for err in exc.errors():
         loc = [str(p) for p in err.get("loc", []) if p not in ("body",)]
         service = None
-        if loc and loc[0] in (
-            "services",
-            "dependencies",
-            "fault_domains",
-            "completed_services",
-            "failed_services",
-            "deployed_services",
-        ):
-            service = loc[-1] if loc[-1].isidentifier() or "-" in loc[-1] else None
+        if loc:
+            head, *tail = loc
+            if head in (
+                "services",
+                "dependencies",
+                "fault_domains",
+                "completed_services",
+                "failed_services",
+                "deployed_services",
+            ):
+                # A flat string list carries the offending id directly after
+                # the field name (e.g. ("completed_services", 3) -> the list
+                # value). Nested models (dependencies, fault_domains,
+                # timeline services) only expose the array index, so the id
+                # is not available at the error location.
+                if len(tail) == 1 and head in (
+                    "services",
+                    "completed_services",
+                    "failed_services",
+                    "deployed_services",
+                ):
+                    candidate = tail[0]
+                    if candidate.isidentifier() or "-" in candidate:
+                        service = candidate
         issues.append(
             Issue(
                 code="invalid_request_field",
@@ -415,4 +433,55 @@ def preview_plan_rollback(
         wave_count=output.wave_count,
         max_concurrency=concurrency,
         optimal=output.optimal,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/timeline-audit",
+    response_model=TimelineAuditResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def audit_plan_timeline(
+    plan_id: int,
+    payload: TimelineAuditRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> TimelineAuditResult:
+    """Audit the reported actual execution timeline against the stored plan.
+
+    Each service must report exactly one ``started_at`` / ``finished_at``
+    pair. The timeline is checked against the stored wave barrier (every
+    service of the previous wave finished first) and the direct dependency
+    edges; violations name the service, the constraint object and the overlap
+    in milliseconds. Wave durations and the duration-weighted critical chain
+    of the dependency DAG are computed from the reported windows. The stored
+    plan is read but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_of = {
+        service: wave["index"]
+        for wave in stored["waves"]
+        for service in wave["services"]
+    }
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+
+    output = audit_timeline(services, wave_of, edges, payload)
+
+    return TimelineAuditResult(
+        plan_id=row["id"],
+        name=row["name"],
+        wave_count=row["wave_count"],
+        compliant=output.compliant,
+        violations=output.violations,
+        services=output.service_timings,
+        waves=output.wave_timings,
+        total_duration_ms=output.total_duration_ms,
+        started_at=output.started_at,
+        finished_at=output.finished_at,
+        critical_chain=output.critical_chain,
     )

@@ -7,6 +7,7 @@ expresses "services in this domain cannot co-locate in a wave".
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -160,6 +161,71 @@ class RollbackPreviewRequest(BaseModel):
         if any(not s for s in cleaned):
             raise ValueError("service id must not be blank")
         return cleaned
+
+
+class TimelineEntry(BaseModel):
+    """One service's actual execution window as reported by the caller."""
+
+    service: str = Field(..., min_length=1, description="Service id of the stored plan")
+    started_at: datetime = Field(
+        ...,
+        description=(
+            "Actual start instant as an ISO 8601 string. A timestamp without "
+            "an explicit offset is interpreted as UTC."
+        ),
+    )
+    finished_at: datetime = Field(
+        ...,
+        description=(
+            "Actual finish instant as an ISO 8601 string. A timestamp "
+            "without an explicit offset is interpreted as UTC. Must not "
+            "precede started_at."
+        ),
+    )
+
+    @field_validator("started_at", "finished_at", mode="before")
+    @classmethod
+    def _parse_iso8601(cls, v: Any) -> Any:
+        # JSON must carry an ISO 8601 string; reject numeric unix timestamps
+        # and other non-string inputs instead of letting pydantic coerce them.
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError(
+                    "must be an ISO 8601 timestamp, e.g. "
+                    "'2026-09-22T00:00:00Z'"
+                )
+        if isinstance(v, datetime):
+            return v
+        raise ValueError("must be an ISO 8601 timestamp string")
+
+    @field_validator("service")
+    @classmethod
+    def _strip_service(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("service id must not be blank")
+        return v
+
+
+class TimelineAuditRequest(BaseModel):
+    """Actual per-service execution timeline of one rollout.
+
+    Every service of the stored plan must appear exactly once with its real
+    ``started_at`` / ``finished_at`` instants. The audit checks the timeline
+    against the stored wave assignment and dependency graph; the stored plan
+    itself is never modified.
+    """
+
+    services: list[TimelineEntry] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "One entry per plan service; exactly one entry per service id is "
+            "allowed"
+        ),
+    )
 
 
 # ---- Response models -------------------------------------------------------
@@ -320,6 +386,117 @@ class RollbackPreview(BaseModel):
     )
     optimal: bool = Field(
         ..., description="True when the minimum wave count is proven by the solver"
+    )
+
+
+class TimelineViolation(BaseModel):
+    """One violated ordering constraint, localizable to a service.
+
+    A service started before every service of the previous wave had finished
+    (``constraint == "previous_wave"``) or before one of its direct
+    dependencies had finished (``constraint == "dependencies"``). The
+    offending overlap in milliseconds is always positive.
+    """
+
+    service: str = Field(..., description="Service that started too early")
+    service_wave: int = Field(..., ge=1, description="Stored wave of the service")
+    constraint: Literal["previous_wave", "dependencies"]
+    constraint_wave: int | None = Field(
+        default=None,
+        ge=1,
+        description="Previous wave index (previous_wave violations only)",
+    )
+    constraint_service: str | None = Field(
+        default=None,
+        description="Unfinished direct dependency (dependency violations only)",
+    )
+    blocking_services: list[str] = Field(
+        ...,
+        description=(
+            "Previous-wave services that had not finished when this service "
+            "started (previous_wave violations only); empty otherwise"
+        ),
+    )
+    started_at: datetime = Field(..., description="Reported start of the service")
+    required_after: datetime = Field(
+        ...,
+        description="Instant the constraint required the start to be at or after"
+    )
+    overlap_ms: int = Field(
+        ...,
+        ge=1,
+        description="Milliseconds the service started too early "
+        "(required_after - started_at)",
+    )
+
+
+class ServiceTiming(BaseModel):
+    """Actual execution window and duration of one service (UTC-normalized)."""
+
+    service: str
+    wave: int = Field(..., ge=1, description="Stored wave (1-based)")
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: int = Field(..., ge=0, description="finished_at - started_at")
+
+
+class WaveTiming(BaseModel):
+    """Actual wall-clock time one stored wave took."""
+
+    index: int = Field(..., ge=1, description="Wave number (1-based)")
+    services: list[str] = Field(..., description="Wave members, sorted")
+    started_at: datetime = Field(..., description="Earliest member start (UTC)")
+    finished_at: datetime = Field(
+        ..., description="Latest member finish (UTC)"
+    )
+    duration_ms: int = Field(
+        ..., ge=0, description="Latest finish minus earliest start"
+    )
+
+
+class CriticalChain(BaseModel):
+    """Weighted critical chain of the dependency DAG.
+
+    The chain is ordered prerequisite-first; its length is the maximum total
+    per-service duration along any dependency path. It depends only on the
+    dependency edges and the reported per-service durations, never on the
+    reported start instants.
+    """
+
+    services: list[str] = Field(..., description="Chain members, prerequisite-first")
+    total_duration_ms: int = Field(
+        ..., ge=0, description="Sum of the member services' durations"
+    )
+
+
+class TimelineAuditResult(BaseModel):
+    """Outcome of a read-only timeline audit; never persisted."""
+
+    plan_id: int
+    name: str | None
+    wave_count: int = Field(..., description="Stored plan wave count (unchanged)")
+    compliant: bool = Field(
+        ...,
+        description="False when at least one wave/dependency ordering "
+        "constraint was violated",
+    )
+    violations: list[TimelineViolation] = Field(
+        ..., description="All ordering violations, deterministically ordered"
+    )
+    services: list[ServiceTiming] = Field(
+        ..., description="Per-service timings, sorted by service id"
+    )
+    waves: list[WaveTiming] = Field(..., description="Actual timing per stored wave")
+    total_duration_ms: int = Field(
+        ...,
+        ge=0,
+        description="Wall-clock span from the earliest start to the latest "
+        "finish across all services",
+    )
+    started_at: datetime = Field(..., description="Earliest reported start (UTC)")
+    finished_at: datetime = Field(..., description="Latest reported finish (UTC)")
+    critical_chain: CriticalChain = Field(
+        ..., description="Longest dependency path weighted by service duration"
     )
 
 

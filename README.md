@@ -7,7 +7,10 @@
 可在不落库的前提下模拟约束变更对方案的影响；`POST /plans/{id}/gate` 基于已存储的
 （不可变）波次方案做发布执行门禁，上报已完成与执行失败的服务后，逐波给出可执行
 服务、阻塞服务及可定位原因；`POST /plans/{id}/rollback-preview` 针对当前已上线
-（仍在运行）的服务给出**波次最少、顺序确定**的回滚波次预览（只读，不改方案）。
+（仍在运行）的服务给出**波次最少、顺序确定**的回滚波次预览（只读，不改方案）；
+`POST /plans/{id}/timeline-audit` 用各服务实际上报的开始/结束时间线做**执行时间
+审计**：按已存波次与依赖逐条返回提前启动的违规（含约束对象与重叠毫秒数），并给出
+各波实际耗时与依赖 DAG 上按服务耗时加权的关键链（只读，不改方案）。
 容器启动时自动安装依赖并建表。
 
 ## 一条命令启动
@@ -335,6 +338,121 @@ curl -X POST http://localhost:8000/plans/1/rollback-preview \
 此外，引用不属于本方案的服务返回 422 `unknown_service`，同一服务在请求中重复
 出现返回 422 `duplicate_service`，方案不存在返回 404。
 
+## 实际执行时间线审计（POST /plans/{id}/timeline-audit）
+
+发布完成（或进行到任意时刻）后，把方案内**每个服务唯一的**实际开始/结束时间
+（ISO 8601）发给本接口，服务严格按**已存储的波次方案与依赖图**做审计，方案本身
+不会被修改：
+
+- **前一波屏障**：服务不得在前一波**全部服务**完成前启动；前一波最迟完成的服务
+  定义要求起点，启动时仍在运行的前一波成员在 `blocking_services` 中逐一列出。
+- **直接依赖**：服务不得在任一**直接依赖**完成前启动（即使该依赖位于更早的非相邻
+  波次）。
+- 每条违规返回违规服务、服务所在波次、约束类型（`previous_wave` /
+  `dependencies`）、约束对象（前一波次编号或直接依赖服务）以及
+  **重叠毫秒数 `overlap_ms`**（= 要求起点 − 实际起点，恒为正；恰好在边界启动不算
+  违规）。
+- 合法输入还会计算**各波实际耗时**（最早成员开始到最迟成员结束）、整体跨度，以及
+  在依赖 DAG 上以**各服务实际耗时为权重的最长关键链**（链按依赖在前的顺序给出）。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/timeline-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "services": [
+      {"service": "db",    "started_at": "2026-09-22T00:00:00Z", "finished_at": "2026-09-22T00:01:00Z"},
+      {"service": "auth",  "started_at": "2026-09-22T00:01:00Z", "finished_at": "2026-09-22T00:02:00Z"},
+      {"service": "api",   "started_at": "2026-09-22T00:02:00Z", "finished_at": "2026-09-22T00:04:00Z"},
+      {"service": "cache", "started_at": "2026-09-22T00:04:00Z", "finished_at": "2026-09-22T00:04:30Z"},
+      {"service": "web",   "started_at": "2026-09-22T00:04:00Z", "finished_at": "2026-09-22T00:05:00Z"}
+    ]
+  }'
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`），`web` 与 `cache` 同波互不约束，但都必须
+晚于 `api`。合规时间线响应：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "compliant": true,
+  "violations": [],
+  "services": [
+    {"service": "api",   "wave": 3, "started_at": "2026-09-22T00:02:00Z", "finished_at": "2026-09-22T00:04:00Z", "duration_ms": 120000},
+    {"service": "auth",  "wave": 2, "started_at": "2026-09-22T00:01:00Z", "finished_at": "2026-09-22T00:02:00Z", "duration_ms": 60000},
+    {"service": "cache", "wave": 4, "started_at": "2026-09-22T00:04:00Z", "finished_at": "2026-09-22T00:04:30Z", "duration_ms": 30000},
+    {"service": "db",    "wave": 1, "started_at": "2026-09-22T00:00:00Z", "finished_at": "2026-09-22T00:01:00Z", "duration_ms": 60000},
+    {"service": "web",   "wave": 4, "started_at": "2026-09-22T00:04:00Z", "finished_at": "2026-09-22T00:05:00Z", "duration_ms": 60000}
+  ],
+  "waves": [
+    {"index": 1, "services": ["db"],                "started_at": "2026-09-22T00:00:00Z", "finished_at": "2026-09-22T00:01:00Z", "duration_ms": 60000},
+    {"index": 2, "services": ["auth"],              "started_at": "2026-09-22T00:01:00Z", "finished_at": "2026-09-22T00:02:00Z", "duration_ms": 60000},
+    {"index": 3, "services": ["api"],               "started_at": "2026-09-22T00:02:00Z", "finished_at": "2026-09-22T00:04:00Z", "duration_ms": 120000},
+    {"index": 4, "services": ["cache", "web"],      "started_at": "2026-09-22T00:04:00Z", "finished_at": "2026-09-22T00:05:00Z", "duration_ms": 60000}
+  ],
+  "total_duration_ms": 300000,
+  "started_at": "2026-09-22T00:00:00Z",
+  "finished_at": "2026-09-22T00:05:00Z",
+  "critical_chain": {"services": ["db", "auth", "api", "web"], "total_duration_ms": 300000}
+}
+```
+
+存在违规时 HTTP 仍为 **200**，`compliant=false` 且 `violations` 非空；例如 `web`
+在 `api` 尚未完成时提前 30 秒启动，会同时收到前一波屏障与直接依赖两条违规：
+
+```json
+{
+  "compliant": false,
+  "violations": [
+    {
+      "service": "web",
+      "service_wave": 4,
+      "constraint": "previous_wave",
+      "constraint_wave": 3,
+      "constraint_service": null,
+      "blocking_services": ["api"],
+      "started_at": "2026-09-22T00:03:30Z",
+      "required_after": "2026-09-22T00:04:00Z",
+      "overlap_ms": 30000
+    },
+    {
+      "service": "web",
+      "service_wave": 4,
+      "constraint": "dependencies",
+      "constraint_wave": null,
+      "constraint_service": "api",
+      "blocking_services": [],
+      "started_at": "2026-09-22T00:03:30Z",
+      "required_after": "2026-09-22T00:04:00Z",
+      "overlap_ms": 30000
+    }
+  ]
+}
+```
+
+说明与约定：
+
+- **时间解析**：ISO 8601（如 `2026-09-22T00:00:00Z` 或带偏移 `+02:00`）；不带时区
+  偏移的时间按 **UTC** 解释，响应中的时间统一归一化为 UTC。
+- **关键链**：只依赖依赖边与各服务 `finished_at - started_at` 的服务耗时，与实际
+  启动时刻、波次间隔无关；等权时按链长与服务 id 字典序确定，结果确定且与请求中
+  条目的排列顺序无关。
+- 即使存在违规，只要输入结构合法，波次耗时、总跨度与关键链仍会照常计算。
+- 审计为**只读**操作，不写库、不改方案；重复请求得到相同结果，方案不存在返回 404。
+
+输入结构问题统一返回 **422**（信封同下），每个问题都可定位到具体服务：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `missing_timeline_service` | 方案中的某个服务缺少时间线条目 |
+| `duplicate_timeline_service` | 同一服务出现多条时间线条目 |
+| `unknown_service` | 条目引用了不属于本方案的服务 |
+| `timeline_service_time_inverted` | 某服务 `finished_at` 早于 `started_at`（context 附两个时间） |
+| `invalid_request_field` | 时间不是合法 ISO 8601、缺字段或服务 id 为空白，附带字段位置 |
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -371,6 +489,8 @@ curl -X POST http://localhost:8000/plans/1/rollback-preview \
 | `completed_with_failed_dependency` / `completed_before_dependencies` | 门禁上报的「已完成」与其失败上游或未完成依赖矛盾 |
 | `rollback_prerequisite_not_deployed` | 回滚预览的上线集合违反依赖闭包：已上线服务的某个前置未上线（附缺失前置） |
 | `duplicate_service` | 回滚预览请求中同一服务重复出现 |
+| `missing_timeline_service` / `duplicate_timeline_service` | 时间线审计缺少某方案服务的条目 / 同一服务出现多条 |
+| `timeline_service_time_inverted` | 时间线审计中某服务结束时间早于开始时间 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
 
 ## API 一览
@@ -381,6 +501,7 @@ curl -X POST http://localhost:8000/plans/1/rollback-preview \
 | POST | `/plans/{id}/simulate` | 约束变更影响模拟（不落库）：新波次、波次增减、逐服务新旧波次、受影响服务 |
 | POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
 | POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
+| POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：每服务唯一的 started_at/finished_at；逐条返回违反前一波屏障/直接依赖的服务、约束对象与重叠毫秒数，并给出各波实际耗时与服务耗时加权的关键链；缺失/重复/未知服务、时间倒置 422 可定位 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
@@ -424,9 +545,10 @@ app/
   planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
   gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
   rollback.py   # 回滚预览：上线集合依赖闭包校验、反向边回滚波次生成
+  timeline.py   # 时间线审计：波次/依赖时序违规、各波实际耗时、加权关键链
   db.py         # SQLite 初始化与 CRUD
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt
